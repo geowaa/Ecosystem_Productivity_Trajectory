@@ -1,0 +1,1645 @@
+---
+title: "Abrupt shifts of vegetation productivity"
+author: "Wang Zhuangzhuang"
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+vignette: >
+  %\VignetteIndexEntry{Vignette Title}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Typology clasification
+
+This code shows how the typology classification is processed.
+
+```{r prep,echo=TRUE,eval=TRUE}
+library(raster)
+library(sp)
+library(tidyverse)
+library(naniar)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(maptools)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(gridExtra)
+library(chngpt)
+library(parallel)
+
+```
+
+
+### Prepare data
+
+```{r}
+#load required data
+kNDVI_filename<-list.files(path="E:/Article writing/3 Vegetation greening and resilience/Datasets/kNDVI_yearly", pattern = '.tif$')
+kNDVI_file<-paste0("E:/Article writing/3 Vegetation greening and resilience/Datasets/kNDVI_yearly/",kNDVI_filename)
+kNDVI <- stack(kNDVI_file)  
+#raster to data frame
+kNDVI_dataframe<-as.data.frame(kNDVI, xy = TRUE)
+kNDVI_dataframe$nn<-21-(kNDVI_dataframe %>% 
+  n_miss_row())
+kNDVI_dataframe$Point.ID<-rownames(kNDVI_dataframe)
+dff<-kNDVI_dataframe[,c(25,24,3:23)]
+
+Sites=unique(dff$Point.ID)
+```
+
+
+### Processing types of trajectories
+
+Lets try to find the typology of trajectories by using AIC criteria and see whether something interesting emerges. In this case lets stick to cases where we have, at least 75% of information (i.e., at least 12 years) and we are only interested in NDVI trends
+
+In this study, we only used the samples with complete time series.
+
+```{r selectcasesNDVI, echo=TRUE,eval=FALSE}
+
+table(dff$nn)
+
+```
+
+Once identified lets do a very simple approach. We fit a linear, a quadratic and a step regression and save AICs. I also compare those and select the best fitting in a factor variable. Note that I standardize NDVI values before fitting them. I do it only with the bootstrap:
+
+
+```{r typestrajectoriesBOOT, echo=TRUE,eval=FALSE}
+
+#only use cases with complete valid years
+ids=dff$Point.ID[dff$nn==21]
+
+#Prepare parallel
+noCores=detectCores()-2
+cl=makeCluster(noCores)
+clusterEvalQ(cl,library("chngpt"))
+
+
+dfres=parLapply(cl,ids, function(x,df){
+  dfi=data.frame(year=seq(from=2000, to=2020),NDVI=as.numeric(df[df$Point.ID==x,c(3:23)])) #Build the dataset for the site time series
+  dfi=as.data.frame(lapply(dfi, function(y){return((y-mean(y,na.rm = TRUE))/sd(y,na.rm = TRUE))})) #Standardization of variables
+  dfi$md=mahalanobis(dfi,center = apply(dfi[,1:2], MARGIN = 2, FUN=function(x) return(median(x,na.rm = TRUE))),cov = cov(dfi,use = "complete.obs")) #Calculates mahalanobis distance
+  dfi=dfi[complete.cases(dfi),]
+  dfi$md[dfi$md<12]=6 #Enforce md<12 to be 6; these are most likely chosen as have no significant MD (significance level of MD following a chisquared distribution is 12)
+
+  dfresi=lapply(1:100, function(yy,dd) {
+      #boot sample
+      dd=dd[sample(1:nrow(dd),nrow(dd),replace = TRUE,prob = 1/dd$md),]
+      #fitting models
+      mdl0=glm(data=dd,formula=NDVI~1,family = "gaussian")
+      mdl1=glm(data=dd,formula=NDVI~year,family = "gaussian")
+      mdl2=glm(data = dd,formula = NDVI~poly(year,degree = 2),family = "gaussian")
+      mdl3=chngptm(formula.1 = NDVI~1,formula.2 = ~year,data = dd,type="step",family = "gaussian")
+      
+      #Model selection
+      aics=c(aic.notrend=mdl0$aic,aic.Lineal=mdl1$aic,aic.Quad=mdl2$aic,aic.Step=mdl3$best.fit$aic) #build AICs
+      aics=aics[order(aics)] #ordered aics
+      daics=aics-min(aics) #delta AICs to see their corresponding difference with the best model
+      complexity=c("aic.notrend","aic.Lineal","aic.Step","aic.Quad") #model complexity from less to most complex
+
+      daics[daics<2]=0 #delta aics lower than 2 are set to 0
+      bf=complexity[min(match(names(daics[daics==0]),complexity))] #decide among daics = 0 which is the less complex
+      bf=strsplit(bf,".",fixed = TRUE)[[1]][2] #extract the name of the best fit
+      
+      
+      #The whole process of model selection is repeated without taking into account steps
+      aicsLQ=c(aic.notrend=mdl0$aic,aic.Lineal=mdl1$aic,aic.Quad=mdl2$aic) #this is not taking into account steps
+      aicsLQ=aicsLQ[order(aicsLQ)]
+      daicsLQ=aicsLQ-min(aicsLQ)
+      complexity2=c("aic.notrend","aic.Lineal","aic.Quad")
+
+      daicsLQ[daicsLQ<2]=0
+      bfLQ=complexity2[min(match(names(daicsLQ[daicsLQ==0]),complexity2))]
+      bfLQ=strsplit(bfLQ,".",fixed = TRUE)[[1]][2]      
+
+      
+      coffall=c(a=NA,b=NA,stp=NA,chnpt=NA) #allocate a vector of parameters
+      coffLQ=c(aLQ=NA,bLQ=NA) #and another one without steps
+      
+      #Set parameter values of the best model
+      if(bf=="Lineal"){
+        coffall[2]=mdl1$coefficients[2]
+      }else if (bf=="Quad"){
+        coffall[1]=mdl2$coefficients[3]
+        coffall[2]=mdl2$coefficients[2]
+      } else if (bf=="Step"){
+        coffall[3]=mdl3$best.fit$coefficients[2]
+        coffall[4]=mdl3$coefficients[3]
+      }
+      
+      #The same without taking into account steps
+      if(bfLQ=="Lineal"){
+        coffLQ[2]=mdl1$coefficients[2]
+      }else if (bfLQ=="Quad"){
+        coffLQ[1]=mdl2$coefficients[3]
+        coffLQ[2]=mdl2$coefficients[2]
+      }
+      
+      #generate vector of results
+      vv=as.data.frame(t(c(btID=yy,coffall,coffLQ)))
+      vv$bestfit=bf
+      vv$bestfitLQ=bfLQ
+      return(vv)
+  },dd=dfi)
+  dfresi=as.data.frame(do.call(rbind,dfresi)) #this contains results of all bootstraps for this site
+  
+  bff=table(dfresi$bestfit)  #check which is the best fit and how many times it is
+  bf=names(bff[which.max(bff)])
+  certainty.bf=max(bff)/sum(bff) #certainty of best model selection
+  coff=c(a=NA,b=NA,stp=NA,aci=NA,bci=NA,stpci=NA,sdchngpt=NA,chngpt=NA) #allocate for this site parameters results
+  #calculate medians of parameters of the best fit and confidence intervals
+  if(bf=="Lineal"){
+    coff[2]=median(dfresi$b[dfresi$bestfit=="Lineal"])
+    coff[5]=median(dfresi$b[dfresi$bestfit=="Lineal"])-quantile(dfresi$b[dfresi$bestfit=="Lineal"],0.05)
+  }else if (bf=="Quad"){
+    coff[1]=median(dfresi$a[dfresi$bestfit=="Quad"])
+    coff[2]=median(dfresi$b[dfresi$bestfit=="Quad"])
+    coff[4]=median(dfresi$a[dfresi$bestfit=="Quad"])-quantile(dfresi$a[dfresi$bestfit=="Quad"],0.05)
+    coff[5]=median(dfresi$b[dfresi$bestfit=="Quad"])-quantile(dfresi$b[dfresi$bestfit=="Quad"],0.05)
+  } else if (bf=="Step"){
+    coff[3]=median(dfresi$stp[dfresi$bestfit=="Step"])
+    coff[6]=median(dfresi$stp[dfresi$bestfit=="Step"])-quantile(dfresi$stp[dfresi$bestfit=="Step"],0.05)
+    coff[7]=sd(dfresi$chnpt[dfresi$bestfit=="Step"],na.rm = TRUE)
+    coff[8]=median(dfresi$chnpt[dfresi$bestfit=="Step"],na.rm = TRUE)
+  }
+  
+  #We do the same without taking into account steps 'bestfitLQ'是没有将step这种情况考虑在内
+  bffLQ=table(dfresi$bestfitLQ)
+  bfLQ=names(bffLQ[which.max(bffLQ)])
+  certainty.bfLQ=max(bffLQ)/sum(bffLQ)
+  coffLQ=c(aLQ=NA,bLQ=NA,aciLQ=NA,bciLQ=NA)
+  if(bfLQ=="Lineal"){
+    coffLQ[2]=median(dfresi$bLQ[dfresi$bestfitLQ=="Lineal"])
+    coffLQ[4]=median(dfresi$bLQ[dfresi$bestfitLQ=="Lineal"])-quantile(dfresi$bLQ[dfresi$bestfitLQfit=="Lineal"],0.05)
+  }else if (bfLQ=="Quad"){
+    coffLQ[1]=median(dfresi$aLQ[dfresi$bestfitLQ=="Quad"])
+    coffLQ[2]=median(dfresi$bLQ[dfresi$bestfitLQ=="Quad"])
+    coffLQ[3]=median(dfresi$aLQ[dfresi$bestfitLQ=="Quad"])-quantile(dfresi$aLQ[dfresi$bestfitLQ=="Quad"],0.05)
+    coffLQ[4]=median(dfresi$bLQ[dfresi$bestfitLQ=="Quad"])-quantile(dfresi$bLQ[dfresi$bestfitLQ=="Quad"],0.05)
+  }
+  
+  vvr=as.data.frame(t(c(Point.ID=x,certainty.bf=certainty.bf,certainty.bfLQ=certainty.bfLQ,coff,coffLQ))) #final vector of results
+  vvr$bestfit=bf
+  vvr$bestfitLQ=bfLQ
+  
+  return(vvr)
+  
+},df=dff)
+
+stopCluster(cl)
+
+save(dfres, file = "dfres.RData")
+
+dfres2=as.data.frame(do.call(rbind,dfres)) #final database of clasification
+
+#Data are saved so that the computation is not performed again. You may find the results as an attached database at figshare
+write.csv(dfres2,"TypesMD.csv")
+
+```
+
+Resulting file contains the best fit clasification, both taking and without taking into account step behaviors. We did the procedure without taking into account steps because if the clasification do not fullfill some criteria (next section) they will be re-classified directly as the best model among LQ types (without taking into acount steps).
+
+Right now the best fits are clasified as: notrend, lineal trend, quadratic trend or step trend, without attending to whether this trend is positive, negative or neutral (which will be assessed afterwards based on parameters stored)
+
+### Further filtering step behaviors
+
+Steps are further filtered based on the next criteria:
+
+#### Criteria 1: The extremes
+
+Steps whose change point occurs in the extremes (2000-2003 or 2016-2019) are discarded.
+
+#### Criteria 2: How standard deviation on changepoints influence certainty
+
+Steps whose change point standard deviation (as calculated during bootstrap) compromise certainty in clasification are disregarded.
+
+To know which standard deviation in change point was compromising certainty we related both parameters. We found a breakpoint in their relationship on sdchangepoint=0.68. From that sdchangepoint on certainty stabilized as very low.
+```{r adchangepont, eval=TRUE,echo=TRUE}
+dfres=read.csv("TypesMD.csv") 
+#This file is provided in the figshare.
+
+dfres$type=1
+dfres$type[dfres$sdchngpt>0.6856748]=2
+  
+p2<-ggplot(data = dfres[dfres$bestfit=="Step",],aes(x=sdchngpt,y=certainty.bf))+
+  theme_classic()+
+  geom_point(size=0.1)+
+  geom_smooth(method = "lm",aes(group=type),color="black")+
+  geom_density2d()
+
+p2
+```
+
+Please note in the figure that still the left part of the fitting is not tracking a straight line of the most dense point cloud. This occurs because still there are points with low certainty in the left side  that are draging the fit. To account for this we additionally not regarded steps that have certainty lower than 0.7.
+
+#### Criteria 3: Only real regime shifts
+
+Steps in which the values of NDVI before and after the change point are not statistically different should be disregarded, as those do not match proper definition of regime shift (i.e., changes in structure and/or functioning fundamentally changed respect to original state)
+
+To assess this, we did a re-check of step behaviors using a wald test.
+
+```{r recheck bimod, eval=FALSE,echo=TRUE}
+
+library(diptest)
+
+Dynamic=dff
+
+#sites=DF$Site[DF$TrajType=="Step"]
+sites=dfres$Point.ID[dfres$bestfit=="Step"]
+
+res=lapply(sites, function(x,df,dfres){
+  dfi=data.frame(year=seq(from=2000, to=2020),NDVI=as.numeric(df[df$Point.ID==x,c(3:23)]))
+  dfi=as.data.frame(lapply(dfi, function(y){return((y-mean(y,na.rm = TRUE))/sd(y,na.rm = TRUE))})) #Standardization of variables
+  fg=dip.test(dfi$NDVI,simulate.p.value = TRUE)
+  chngpt=dfres$chngpt[dfres$Point.ID==x]
+  x1=dfi$NDVI[dfi$year<chngpt]
+  x2=dfi$NDVI[dfi$year>chngpt]
+  fg2=ks.test(x1,x2)
+  pvalKS=fg2$p.value
+  return(data.frame(site=x,Dstatistic=fg$statistic,Pval=fg$p.value,pvalKS=pvalKS))
+},df=Dynamic,dfres=dfres)
+res=do.call(rbind,res)
+
+hist(log(res$Pval))
+write.csv(res,file="rechecksteps.csv")
+```
+
+## Building the final dataset
+
+### Re-clasifying cases that do not meet criteria for being steps
+
+```{r buildDF}
+
+dfres=read.csv("TypesMD.csv") #the classified typologies file
+recheck=read.csv("rechecksteps.csv") #the results of the KS test comparing NDVI prior/after change point
+recheck$invalid=recheck$pvalKS>0.05 #not significant differences on NDVI are marked as invalid
+invalids=recheck$site[recheck$invalid=="TRUE"]
+
+
+#put as type=2 those sites to be re-clasified
+dfres$type=1
+dfres$type[dfres$chngpt<(-1.2)]=2 #Meet criteria 1 (left side)
+dfres$type[dfres$chngpt>(1.21)]=2 #Meet criteria 1 (right side)
+dfres$type[dfres$sdchngpt>0.6856748]=2 #Meet Criteria 2
+dfres$type[dfres$bestfit=="Step" && dfres$certainty.bf<0.7]=2 #Meet criteria 2
+dfres$type[dfres$Point.ID %in% invalids]=2 #Meet criteria 3
+
+```
+
+### Assigning classes of shapes and trends
+
+We assign classes of shape and trends as said in the Methods section
+
+```{r assigning classes}
+dfres$subtypes=NA
+dfres$subtypes[dfres$bestfit=="Step" & dfres$stp>0]="Positive Step"
+dfres$subtypes[dfres$bestfit=="Step" & dfres$stp<0]="Negative Step"
+dfres$subtypes[dfres$bestfit=="Lineal" & dfres$b<0]="Negative Linear"
+dfres$subtypes[dfres$bestfit=="Lineal" & dfres$b>0]="Positive Linear"
+dfres$subtypes[dfres$bestfit=="Quad" & dfres$a>0 & (dfres$b- dfres$bci)>0]="Positive Quad"
+dfres$subtypes[dfres$bestfit=="Quad" & dfres$a<0 & (dfres$b+dfres$bci)<0]="Negative Quad"
+dfres$subtypes[dfres$bestfit=="Quad" & dfres$a<0 & (dfres$b-dfres$bci)>0]="Positive Quad"
+dfres$subtypes[dfres$bestfit=="Quad" & dfres$a>0 & (dfres$b+dfres$bci)<0]="Negative Quad"
+dfres$subtypes[dfres$bestfit=="Quad" & dfres$a<0 & (dfres$b-dfres$bci)<0 & (dfres$b+dfres$bci)>0]="Shifting"
+dfres$subtypes[dfres$bestfit=="Quad" & dfres$a>0 & (dfres$b-dfres$bci)<0 & (dfres$b+dfres$bci)>0]="Shifting"
+dfres$subtypes[dfres$bestfit=="notrend"]="notrend"
+
+#do the same for cases not taking into account steps
+dfres$subtypesLQ=NA
+dfres$subtypesLQ[dfres$bestfitLQ=="Lineal" & dfres$bLQ<0]="Negative Linear"
+dfres$subtypesLQ[dfres$bestfitLQ=="Lineal" & dfres$bLQ>0]="Positive Linear"
+dfres$subtypesLQ[dfres$bestfitLQ=="Quad" & dfres$aLQ>0 & (dfres$bLQ- dfres$bciLQ)>0]="Positive Quad"
+dfres$subtypesLQ[dfres$bestfitLQ=="Quad" & dfres$aLQ<0 & (dfres$bLQ+dfres$bciLQ)<0]="Negative Quad"
+dfres$subtypesLQ[dfres$bestfitLQ=="Quad" & dfres$aLQ<0 & (dfres$bLQ-dfres$bciLQ)>0]="Positive Quad"
+dfres$subtypesLQ[dfres$bestfitLQ=="Quad" & dfres$aLQ>0 & (dfres$bLQ+dfres$bciLQ)<0]="Negative Quad"
+dfres$subtypesLQ[dfres$bestfitLQ=="Quad" & dfres$aLQ<0 & (dfres$bLQ-dfres$bciLQ)<0 & (dfres$bLQ+dfres$bciLQ)>0]="Shifting"
+dfres$subtypesLQ[dfres$bestfitLQ=="Quad" & dfres$aLQ>0 & (dfres$bLQ-dfres$bciLQ)<0 & (dfres$bLQ+dfres$bciLQ)>0]="Shifting"
+dfres$subtypesLQ[dfres$bestfitLQ=="notrend"]="notrend"
+
+#finally assign different bestfit and subtypes to step cases that need re-clasification.
+dfres$bestfit[dfres$type==2]=dfres$bestfitLQ[dfres$type==2]
+dfres$subtypes[dfres$type==2]=dfres$subtypesLQ[dfres$type==2]
+
+write.csv(dfres,file="TypesMD2.csv")
+```
+
+
+## Basic summary statistics (Figure 3)
+
+```{r opening, echo=TRUE, eval=TRUE}
+library(reshape2)
+library(ggplot2)
+library(dplyr)
+
+#DF=read.csv("FinalDB3.csv")
+DF=read.csv("TypesMD2.csv")
+DF=DF[,c(3,18,21)]
+colnames(DF)=c("Site","TrajType","TrajSubtype")
+
+```
+
+
+here we plot the pie diagram plus examples and maps
+
+### Trajectory types in a pie diagram (Figure 3b)
+
+```{r pie,echo=TRUE,eval=TRUE}
+library(moonBook)
+library(webr)
+library(ggplot2)
+library(eoffice)
+
+DF$TrajType2=DF$TrajType
+DF$TrajType2[DF$TrajType2=="notrend"]="Lineal"
+DF$TrajType2=as.factor(as.character(DF$TrajType2))
+
+DF$PNN[DF$TrajSubtype=="Positive Linear"]="Positive"
+DF$PNN[DF$TrajSubtype=="Positive Quad"]="Positive"
+DF$PNN[DF$TrajSubtype=="Positive Step"]="Positive"
+
+DF$PNN[DF$TrajSubtype=="Negative Linear"]="Negative"
+DF$PNN[DF$TrajSubtype=="Negative Quad"]="Negative"
+DF$PNN[DF$TrajSubtype=="Negative Step"]="Negative"
+
+DF$PNN[DF$TrajSubtype=="notrend"]="Neutral"
+DF$PNN[DF$TrajSubtype=="Shifting"]="Neutral"
+
+PieDonut(data = DF,aes(pies=PNN,donuts=TrajSubtype),
+         showRatioThreshold=0.0001,
+         r0=0,
+         labelposition = 1,
+         #selected=c(2,4,6,8),
+         showPieName = FALSE,
+         labelpositionThreshold = 4) #trendtype
+
+PieDonut(data = DF,aes(pies=TrajType2,donuts=TrajSubtype),r0=0,showRatioThreshold=0.001,
+         showPieName = FALSE,labelpositionThreshold = 3) #trendtype
+
+#topptx(filename = "test.pptx")
+```
+
+### Trajectory types in a Spatial map (Figure 3a)
+
+```{r}
+SPDF=DF[,c(1,3)]
+SPDF$type[SPDF$TrajSubtype=="Negative Step"]="Negative abrupt"
+SPDF$type[SPDF$TrajSubtype=="Positive Step"]="Positive abrupt"
+SPDF$type[SPDF$TrajSubtype=="Negative Linear"]="Negative non abrupt"
+SPDF$type[SPDF$TrajSubtype=="Negative Quad"]="Negative non abrupt"
+SPDF$type[SPDF$TrajSubtype=="Positive Linear"]="Positive non abrupt"
+SPDF$type[SPDF$TrajSubtype=="Positive Quad"]="Positive non abrupt"
+SPDF$type[SPDF$TrajSubtype=="notrend"]="Neutral"
+SPDF$type[SPDF$TrajSubtype=="Shifting"]="Neutral"
+
+XY<-kNDVI_dataframe[,c(1,2,25)]
+
+merge_data<-merge(SPDF,XY,by.x = "Site", by.y = "Point.ID") 
+
+
+##==== Draw ====##
+crs<-"+proj=aea +lat_0=0 +lon_0=105 +lat_1=25 +lat_2=47 +x_0=4000000 +y_0=0 +datum=WGS84 +units=m +no_defs"
+my_col <- c("#780000", "#FF6666", "#EBDF9A", "#000068", "#7FCDFF")
+my_col2 <- c("#780000", "#FF6666", "#EBDF9A", "#267300", "#e4f9f5") #bbded6 #e4f9f5
+
+ggplot()+
+  geom_raster(data=merge_data,aes(x = x,y = y,fill = type))+
+  #geom_raster(data=FG_ar1_rwin60_data1_kendall_p_insig,aes(x = x,y = y),fill="white")+
+  scale_fill_manual(values = my_col2, name = "slope")+
+  #geom_line(data=bioclimatic_zonal,aes(x=long,y=lat,group=id),colour = "black",size = 0.5)+
+  #geom_polygon(data=bioclimatic_zonal,aes(x=long,y=lat,group=id),fill = NA,colour = "black",size = 0.5)+
+  coord_sf(crs=crs)+
+  theme_bw()+
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        #axis.line = element_blank(),
+        panel.background = element_rect(fill = "#f5f5f2", color = NA),
+        panel.border = element_rect(colour = "black",size = 0.5), #element_blank()
+        legend.position = "none",
+        aspect.ratio = 3/4)  #bottom none
+
+#topptx(filename = "test2.pptx")
+
+# Export trajsubtype raster for following analysis (as explained variable in analysis of influencing factors)
+trajSubtype<-merge_data[,c(2,4,5)]
+trajSubtype$TrajSubtype[trajSubtype$TrajSubtype=="Negative Linear"]=1
+trajSubtype$TrajSubtype[trajSubtype$TrajSubtype=="Negative Quad"]=2
+trajSubtype$TrajSubtype[trajSubtype$TrajSubtype=="Negative Step"]=3
+trajSubtype$TrajSubtype[trajSubtype$TrajSubtype=="notrend"]=4
+trajSubtype$TrajSubtype[trajSubtype$TrajSubtype=="Positive Linear"]=5
+trajSubtype$TrajSubtype[trajSubtype$TrajSubtype=="Positive Quad"]=6
+trajSubtype$TrajSubtype[trajSubtype$TrajSubtype=="Positive Step"]=7
+trajSubtype$TrajSubtype[trajSubtype$TrajSubtype=="Shifting"]=8
+trajSubtype<-subset(trajSubtype,select=c(2,3,1))
+
+trajectory_type<-rasterFromXYZ(trajSubtype[1:3],crs="+proj=aea +lat_0=0 +lon_0=105 +lat_1=25 +lat_2=47 +x_0=4000000 +y_0=0 +datum=WGS84 +units=m +no_defs")
+
+writeRaster(trajectory_type,filename = "E:/Article writing/data/Datasets/Change_trajectory/trajectory_type.tif")
+```
+
+### Trajectory type examples
+The examples chosen are the next ones (note that you will need the time series to compute them):
+
+```{r examples, eval=FALSE,echo=TRUE}
+library(chngpt)
+
+#dd=read.csv("C:/Users/velai/Dropbox/Drydin/Datanew/Time Series new.csv")
+#dff=dd[,c(22,21,1:19)]
+
+ids=c(NegativeStep=577782,notrend=54489,Shifting=377626,NegativeLineal=445106,PositiveLineal=74046, PositiveStep=69435,NegativeQuad=596088,PositiveQuad=103500)
+
+dfexample=lapply(ids, function(id,dff){
+  dfi=data.frame(year=seq(from=2000, to=2020),NDVI=as.numeric(dff[dff$Point.ID==id,c(3:23)]))
+  dfi$NDVI=(dfi$NDVI-mean(dfi$NDVI,na.rm = TRUE))/sd(dfi$NDVI,na.rm = TRUE) #Standardization of variables
+  dfi$id=id
+  return(dfi)
+},dff=dff)
+dfexample=do.call(rbind,dfexample)
+#dfexample$type=rep(unique(DF$TrajSubtype),each=21)
+dfexample$trendtype=DF$TrajType2[match(dfexample$id,DF$Site)]
+dfexample$TrajType=DF$TrajSubtype[match(dfexample$id,DF$Site)]
+dfexample$TrajType=as.character(dfexample$TrajType)
+dfexample$TrajType[dfexample$TrajType=="Quad"]="Quadratic"
+dfexample$TrajType=as.factor(dfexample$TrajType)
+
+
+ggplot(data = dfexample,aes(x = year,y=NDVI))+
+  geom_line(size=1)+
+  ylab("Standardized NDVI \n (unitless)")+
+  facet_grid(~TrajType)+
+  theme(strip.background = element_blank(),
+        strip.text = element_text(face="bold",size = 12))
+
+##----Draw----##
+
+Negativelinear<-dfexample[64:84,1:2]
+t1<-ggplot()+
+  theme_classic()+
+  geom_line(data = Negativelinear,aes(x = year,y=NDVI),size=1,color="gray30")+
+  geom_smooth(data = Negativelinear,aes(x = year,y=NDVI),
+              method = "lm", formula = y ~ x,se = FALSE,color="#FF6666",linetype=5)+
+  ylab("Standardized kNDVI")+
+  xlab("Year")+
+  theme(strip.background = element_blank(),
+        strip.text = element_text(face="bold",size = 12),
+        aspect.ratio = 5/5)
+
+
+NegativeQuad<-dfexample[127:147,1:2]
+t2<-ggplot()+
+  theme_classic()+
+  geom_line(data = NegativeQuad,aes(x = year,y=NDVI),size=1,color="gray30")+
+  geom_smooth(data = NegativeQuad,aes(x = year,y=NDVI),
+              method = "glm", formula = y~poly(x,degree = 2),se = FALSE,color="#FF6666",linetype=5)+
+  ylab("Standardized kNDVI")+
+  xlab("Year")+
+  theme(strip.background = element_blank(),
+        strip.text = element_text(face="bold",size = 12),
+        aspect.ratio = 5/5)
+
+
+NegativeStep<-dfexample[1:21,1:2]
+chngptm(formula.1 = NDVI~1,formula.2 = ~year,data = NegativeStep,type="step",family = "gaussian")
+t3<-ggplot()+
+  theme_classic()+
+  geom_line(data = NegativeStep,aes(x = year,y=NDVI),size=1,color="gray30")+
+  geom_smooth(data = NegativeStep[1:9,],aes(x = year,y=NDVI),
+              method = "lm", formula = y ~ x,se = FALSE,color="#FF6666",linetype=5)+
+  geom_smooth(data = NegativeStep[10:21,],aes(x = year,y=NDVI),
+              method = "lm", formula = y ~ x,se = FALSE,color="#FF6666",linetype=5)+
+  ylab("Standardized kNDVI")+
+  xlab("Year")+
+  theme(strip.background = element_blank(),
+        strip.text = element_text(face="bold",size = 12),
+        aspect.ratio = 5/5)
+
+
+
+notrend<-dfexample[22:42,1:2] #这个案例不是很好
+t4<-ggplot()+
+  theme_classic()+
+  geom_line(data = notrend,aes(x = year,y=NDVI),size=1,color="gray30")+
+  geom_smooth(data = notrend,aes(x = year,y=NDVI),
+              method = "lm", formula = y ~ x,se = FALSE,color="#EBDF9A",linetype=5)+
+  ylab("Standardized kNDVI")+
+  xlab("Year")+
+  theme(strip.background = element_blank(),
+        strip.text = element_text(face="bold",size = 12),
+        aspect.ratio = 5/5)
+
+
+
+positivelinear<-dfexample[85:105,1:2]
+t5<-ggplot()+
+  theme_classic()+
+  geom_line(data = positivelinear,aes(x = year,y=NDVI),size=1,color="gray30")+
+  geom_smooth(data = positivelinear,aes(x = year,y=NDVI),
+              method = "lm", formula = y ~ x,se = FALSE,color="#267300",linetype=5)+
+  ylab("Standardized kNDVI")+
+  xlab("Year")+
+  theme(strip.background = element_blank(),
+        strip.text = element_text(face="bold",size = 12),
+        aspect.ratio = 5/5)
+
+
+PositiveQuad<-dfexample[148:168,1:2]
+t6<-ggplot()+
+  theme_classic()+
+  geom_line(data = PositiveQuad,aes(x = year,y=NDVI),size=1,color="gray30")+
+  geom_smooth(data = PositiveQuad,aes(x = year,y=NDVI),
+              method = "glm", formula = y~poly(x,degree = 2),se = FALSE,color="#267300",linetype=5)+
+  ylab("Standardized kNDVI")+
+  xlab("Year")+
+  theme(strip.background = element_blank(),
+        strip.text = element_text(face="bold",size = 12),
+        aspect.ratio = 5/5)
+
+
+PositiveStep<-dfexample[106:126,1:2]
+chngptm(formula.1 = NDVI~1,formula.2 = ~year,data = PositiveStep,type="step",family = "gaussian")
+t7<-ggplot()+
+  theme_classic()+
+  geom_line(data = PositiveStep,aes(x = year,y=NDVI),size=1,color="gray30")+
+  geom_smooth(data = PositiveStep[1:18,],aes(x = year,y=NDVI),
+              method = "lm", formula = y ~ x,se = FALSE,color="#267300",linetype=5)+
+  geom_smooth(data = PositiveStep[19:21,],aes(x = year,y=NDVI),
+              method = "lm", formula = y ~ x,se = FALSE,color="#267300",linetype=5)+
+  ylab("Standardized kNDVI")+
+  xlab("Year")+
+  theme(strip.background = element_blank(),
+        strip.text = element_text(face="bold",size = 12),
+        aspect.ratio = 5/5)
+
+
+shifting<-dfexample[43:63,1:2]
+t8<-ggplot()+
+  theme_classic()+
+  geom_line(data = shifting,aes(x = year,y=NDVI),size=1,color="gray30")+
+  geom_smooth(data = shifting,aes(x = year,y=NDVI),
+              method = "glm", formula = y~poly(x,degree = 2),se = FALSE,color="#EBDF9A",linetype=5)+
+  ylab("Standardized kNDVI")+
+  xlab("Year")+
+  theme(strip.background = element_blank(),
+        strip.text = element_text(face="bold",size = 12),
+        aspect.ratio = 5/5)
+
+library(cowplot)
+plot_grid(t1, t2, t3, t4, t5, t6, t7, t8, ncol = 4, align = 'v')
+
+topptx(filename="test3.pptx",width = 12,height = 12)
+```
+
+### Land use types in 2020 (Figure 3c-d)
+
+
+```{r}
+library(raster)
+library(terra)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(eoffice)
+
+LULC2020=raster("E:/Article writing/data/Datasets/Land_use/Globalland30/2020.tif")
+LULC2020=as(LULC2020, "SpatialPixelsDataFrame")
+LULC2020=as.data.frame(LULC2020) %>% 
+  rename(LULC2020 = X2020)
+LULC2020=LULC2020[-which(LULC2020$LULC2020==128),]
+
+#Reclassify land use data
+LULC2020$RLU2020=ifelse(LULC2020$LULC2020==10,1,
+                      ifelse(LULC2020$LULC2020 %in% c(20,40),2,
+                             ifelse(LULC2020$LULC2020==30,3,
+                                    ifelse(LULC2020$LULC2020 %in% c(50,60), 4,
+                                           ifelse(LULC2020$LULC2020==80,5,6)))))
+
+# 1 Cultivated land
+# 2 Forest
+# 3 Grassland
+# 4 Water bodies
+# 5 Artificial Surfaces
+# 6 others
+
+##----Draw----##
+crs<-"+proj=aea +lat_0=0 +lon_0=105 +lat_1=25 +lat_2=47 +x_0=4000000 +y_0=0 +datum=WGS84 +units=m +no_defs"
+LU_col <- c("#FFFBB1", "#31AD69", "#9ACE7F", "#A3D6F5", "#DC6478","#C8BEAA") 
+
+ggplot()+
+  geom_raster(data=LULC2020,aes(x = x,y = y,fill = as.factor(RLU2020)))+
+  scale_fill_manual(values = LU_col, name = "LULC")+
+  #geom_line(data=bioclimatic_zonal,aes(x=long,y=lat,group=id),colour = "black",size = 0.5)+
+  #geom_polygon(data=bioclimatic_zonal,aes(x=long,y=lat,group=id),fill = NA,colour = "black",size = 0.5)+
+  coord_sf(crs=crs)+
+  theme_bw()+
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        #axis.line = element_blank(),
+        panel.background = element_rect(fill = "#f5f5f2", color = NA),
+        panel.border = element_rect(colour = "black",size = 0.5), #element_blank()
+        legend.position = "right",
+        aspect.ratio = 3/4)  #bottom none
+
+topptx(filename = "3c.pptx")
+##----Draw----##
+
+
+crs="+proj=aea +lat_0=0 +lon_0=105 +lat_1=25 +lat_2=47 +x_0=4000000 +y_0=0 +datum=WGS84 +units=m +no_defs"
+LULC2020_Recl=rasterFromXYZ(LULC2020[,c(2,3,4)],crs=crs)
+trajectory_type=raster("E:/Article writing/data/Datasets/Change_trajectory/trajectory_type.tif")
+
+#match the two dimensions of the two rasters
+LULC2020_Recl=crop(LULC2020_Recl,trajectory_type)
+trajectory_type=crop(trajectory_type,LULC2020_Recl)
+LULC2020_Recl@extent=trajectory_type@extent
+stack_dta=stack(LULC2020_Recl,trajectory_type)
+
+stack_dta=as(stack_dta, "SpatialPixelsDataFrame")
+stack_dta=as.data.frame(stack_dta) %>% 
+  rename(RLU2020 = RLU2020,type=layer)
+
+LU1_type=data.frame(table(stack_dta[which(stack_dta$RLU2020==1),]$type))
+LU2_type=data.frame(table(stack_dta[which(stack_dta$RLU2020==2),]$type))
+LU3_type=data.frame(table(stack_dta[which(stack_dta$RLU2020==3),]$type))
+LU4_type=data.frame(table(stack_dta[which(stack_dta$RLU2020==4),]$type))
+LU5_type=data.frame(table(stack_dta[which(stack_dta$RLU2020==5),]$type))
+LU6_type=data.frame(table(stack_dta[which(stack_dta$RLU2020==6),]$type))
+
+LU_type=cbind(LU1_type,LU2_type[,2],LU3_type[,2],LU5_type[,2])
+colnames(LU_type)=c("type","Cultivated land","Forest","Grassland",
+                    "Artificial Surfaces")
+
+LU_type=LU_type %>% 
+  pivot_longer(!type)%>%
+  mutate(name=factor(name,levels = c("Cultivated land","Forest","Grassland",
+                                     "Artificial Surfaces")))
+
+stack_col <- c("#fecea8","#e84a5f","#780000","#f6f7d7", "#62d2a2","#1fab89","#267300","#EBDF9A")
+
+ggplot(data=LU_type,aes(x=name,y=value,fill=type))+
+  geom_bar(stat = "identity",position = "fill",width = 0.7)+
+  scale_fill_manual(values = stack_col)+
+  theme_classic()+
+  scale_y_continuous(position = "left",
+                     expand = expansion(mult=c(0.01,0.01)),
+                     breaks = seq(0,1,by=0.25),
+                     labels=c("0","25%","50%","75%","100%"))+
+  theme(panel.grid.major.x = element_line(), #x轴内部ticks的坐标线
+        axis.title = element_blank(), #去除坐标轴标题
+        plot.title = element_text(hjust=0.5),
+        axis.text.y = element_text(size=9), #y轴的刻度线标签
+        axis.text.x = element_text(size=9), #y轴的刻度线标签
+        legend.title = element_blank())
+
+topptx(filename = "3d.pptx")
+
+
+
+
+
+```
+
+
+## Basic summary statics (abrupt years) (Figure 4)
+
+```{r}
+library(reshape2)  
+BP_data=read.csv("TypesMD2.csv")
+
+Positive_chng=BP_data[BP_data$subtypes=="Positive Step",]
+Positive_chng=Positive_chng[,c(3,13)]
+Positive_chng$chngpt2=round(Positive_chng$chngpt,digits=3)
+Positive_chng$year[-0.967>Positive_chng$chngpt2 & Positive_chng$chngpt2>=-1.128]=2003
+Positive_chng$year[-0.806>Positive_chng$chngpt2 & Positive_chng$chngpt2>=-0.967]=2004
+Positive_chng$year[-0.645>Positive_chng$chngpt2 & Positive_chng$chngpt2>=-0.806]=2005
+Positive_chng$year[-0.483>Positive_chng$chngpt2 & Positive_chng$chngpt2>=-0.645]=2006
+Positive_chng$year[-0.322>Positive_chng$chngpt2 & Positive_chng$chngpt2>=-0.483]=2007
+Positive_chng$year[-0.161>Positive_chng$chngpt2 & Positive_chng$chngpt2>=-0.322]=2008
+Positive_chng$year[0>Positive_chng$chngpt2 & Positive_chng$chngpt2>=-0.161]=2009
+Positive_chng$year[0.161>Positive_chng$chngpt2 & Positive_chng$chngpt2>=0]=2010
+Positive_chng$year[0.322>Positive_chng$chngpt2 & Positive_chng$chngpt2>=0.161]=2011
+Positive_chng$year[0.483>Positive_chng$chngpt2 & Positive_chng$chngpt2>=0.322]=2012
+Positive_chng$year[0.645>Positive_chng$chngpt2 & Positive_chng$chngpt2>=0.483]=2013
+Positive_chng$year[0.806>Positive_chng$chngpt2 & Positive_chng$chngpt2>=0.645]=2014
+Positive_chng$year[0.967>Positive_chng$chngpt2 & Positive_chng$chngpt2>=0.806]=2015
+Positive_chng$year[1.128>Positive_chng$chngpt2 & Positive_chng$chngpt2>=0.967]=2016
+Positive_chng$year[Positive_chng$chngpt2>=1.128]=2017
+Positive_chng_year=data.frame(table(Positive_chng$year))
+
+Negative_chng=BP_data[BP_data$subtypes=="Negative Step",]
+Negative_chng=Negative_chng[,c(3,13)]
+Negative_chng$chngpt2=round(Negative_chng$chngpt,digits=3)
+Negative_chng$year[-0.967>Negative_chng$chngpt2 & Negative_chng$chngpt2>=-1.128]=2003
+Negative_chng$year[-0.806>Negative_chng$chngpt2 & Negative_chng$chngpt2>=-0.967]=2004
+Negative_chng$year[-0.645>Negative_chng$chngpt2 & Negative_chng$chngpt2>=-0.806]=2005
+Negative_chng$year[-0.483>Negative_chng$chngpt2 & Negative_chng$chngpt2>=-0.645]=2006
+Negative_chng$year[-0.322>Negative_chng$chngpt2 & Negative_chng$chngpt2>=-0.483]=2007
+Negative_chng$year[-0.161>Negative_chng$chngpt2 & Negative_chng$chngpt2>=-0.322]=2008
+Negative_chng$year[0>Negative_chng$chngpt2 & Negative_chng$chngpt2>=-0.161]=2009
+Negative_chng$year[0.161>Negative_chng$chngpt2 & Negative_chng$chngpt2>=0]=2010
+Negative_chng$year[0.322>Negative_chng$chngpt2 & Negative_chng$chngpt2>=0.161]=2011
+Negative_chng$year[0.483>Negative_chng$chngpt2 & Negative_chng$chngpt2>=0.322]=2012
+Negative_chng$year[0.645>Negative_chng$chngpt2 & Negative_chng$chngpt2>=0.483]=2013
+Negative_chng$year[0.806>Negative_chng$chngpt2 & Negative_chng$chngpt2>=0.645]=2014
+Negative_chng$year[0.967>Negative_chng$chngpt2 & Negative_chng$chngpt2>=0.806]=2015
+Negative_chng$year[1.128>Negative_chng$chngpt2 & Negative_chng$chngpt2>=0.967]=2016
+Negative_chng$year[Negative_chng$chngpt2>=1.128]=2017
+Negative_chng_year=data.frame(table(Negative_chng$year))
+
+chng_year=cbind(Positive_chng_year,Negative_chng_year[,2])
+colnames(chng_year)=c("year","pos","neg")
+chng_year_long=melt(chng_year,id.vars=c("year"))
+
+##----Draw----##
+ggplot(chng_year_long) + 
+  geom_bar(aes(x = year, y=value), stat = "identity")+
+  facet_wrap(. ~ variable,scales = "free_y",nrow = 1)
+
+#8ECFC9
+#32B897
+ggplot() + 
+  geom_bar(data = Positive_chng_year, aes(x = Var1, y=Freq), fill="#32B897",stat = "identity")+ 
+  labs(x="Year",y="Frequency of positive abrupt (Pixels)")+
+  theme(panel.background = element_rect(fill = 'white',color = 'black',size = 0.5),
+        panel.grid = element_blank(),
+        plot.margin = margin(5,5,3,3),
+        plot.background = element_blank(),
+        axis.ticks = element_line(size = 0.2),
+        axis.ticks.length = unit(0.15,'lines'),
+        aspect.ratio = 5/7)
+
+ggplot() + 
+  geom_bar(data = Negative_chng_year, aes(x = Var1, y=Freq), fill="#FE817D",stat = "identity")+
+  labs(x="Year",y="Frequency of negative abrupt (Pixels)")+
+  theme(panel.background = element_rect(fill = 'white',color = 'black',size = 0.5),
+        panel.grid = element_blank(),
+        plot.margin = margin(5,5,3,3),
+        plot.background = element_blank(),
+        axis.ticks = element_line(size = 0.2),
+        axis.ticks.length = unit(0.15,'lines'),
+        aspect.ratio = 5/7)
+
+
+topptx(filename="r1.pptx")
+
+
+  
+```
+
+
+## Analysis of influencing factors
+
+### Preparing explained variables (Figure 5)
+
+
+```{r}
+library(rgdal)
+library(sf)
+library(terra)
+
+#load data
+Counties_shape <- readOGR("E:/Article writing/data/Datasets/Counties_shapefile/Counties_LoessPlateau_pro.shp",
+                             layer = "Counties_LoessPlateau_pro")
+Counties_shape$ID<-1:334
+trajectory_type<-raster("E:/Article writing/data/Datasets/Change_trajectory/trajectory_type.tif")
+regional_stat<-raster::extract(trajectory_type, Counties_shape)
+
+res_region_stat<-data.frame()
+for (i in 1:334){
+  type1<-table(regional_stat[[i]])["1"]/length(regional_stat[[i]])
+  type1<-as.data.frame(type1)
+  rownames(type1)<-1
+  type2<-table(regional_stat[[i]])["2"]/length(regional_stat[[i]])
+  type2<-as.data.frame(type2)
+  rownames(type2)<-1
+  type3<-table(regional_stat[[i]])["3"]/length(regional_stat[[i]])
+  type3<-as.data.frame(type3)
+  rownames(type3)<-1
+  type4<-table(regional_stat[[i]])["4"]/length(regional_stat[[i]])
+  type4<-as.data.frame(type4)
+  rownames(type4)<-1
+  type5<-table(regional_stat[[i]])["5"]/length(regional_stat[[i]])
+  type5<-as.data.frame(type5)
+  rownames(type5)<-1
+  type6<-table(regional_stat[[i]])["6"]/length(regional_stat[[i]])
+  type6<-as.data.frame(type6)
+  rownames(type6)<-1
+  type7<-table(regional_stat[[i]])["7"]/length(regional_stat[[i]])
+  type7<-as.data.frame(type7)
+  rownames(type7)<-1
+  type8<-table(regional_stat[[i]])["8"]/length(regional_stat[[i]])
+  type8<-as.data.frame(type8)
+  rownames(type8)<-1
+  bind<-data.frame(type1,type2,type3,type4,type5,type6,type7,type8)
+  res_region_stat<-rbind(res_region_stat,bind)
+}
+
+#set NA to 0
+res_region_stat[is.na(res_region_stat)] = 0
+res_region_stat$ID<-1:334
+
+Counties_shape2<-merge(Counties_shape,res_region_stat,by.x = "ID", by.y = "ID") 
+Counties_shape_draw<-fortify(Counties_shape)
+# fortify, i.e., make ggplot2-compatible
+type1<-rasterize(x=Counties_shape2, y=trajectory_type, field="type1")
+type2<-rasterize(x=Counties_shape2, y=trajectory_type, field="type2")
+type3<-rasterize(x=Counties_shape2, y=trajectory_type, field="type3")
+type4<-rasterize(x=Counties_shape2, y=trajectory_type, field="type4")
+type5<-rasterize(x=Counties_shape2, y=trajectory_type, field="type5")
+type6<-rasterize(x=Counties_shape2, y=trajectory_type, field="type6")
+type7<-rasterize(x=Counties_shape2, y=trajectory_type, field="type7")
+type8<-rasterize(x=Counties_shape2, y=trajectory_type, field="type8")
+
+type1<-as(type1, "SpatialPixelsDataFrame")
+type2<-as(type2, "SpatialPixelsDataFrame")
+type3<-as(type3, "SpatialPixelsDataFrame")
+type4<-as(type4, "SpatialPixelsDataFrame")
+type5<-as(type5, "SpatialPixelsDataFrame")
+type6<-as(type6, "SpatialPixelsDataFrame")
+type7<-as(type7, "SpatialPixelsDataFrame")
+type8<-as(type8, "SpatialPixelsDataFrame")
+
+type1 <- as.data.frame(type1)
+type2 <- as.data.frame(type2)
+type3 <- as.data.frame(type3)
+type4 <- as.data.frame(type4)
+type5 <- as.data.frame(type5)
+type6 <- as.data.frame(type6)
+type7 <- as.data.frame(type7)
+type8 <- as.data.frame(type8)
+
+##----Draw----##
+crs<-"+proj=aea +lat_0=0 +lon_0=105 +lat_1=25 +lat_2=47 +x_0=4000000 +y_0=0 +datum=WGS84 +units=m +no_defs"
+
+plot1<-ggplot()+
+  geom_raster(data=type1,aes(x = x,y = y,fill = layer))+
+  scale_fill_distiller(palette = "PuRd",direction = 1)+
+  geom_polygon(data=Counties_shape_draw,aes(x=long,y=lat,group=id),fill = NA,colour = "black",size = 0.3)+
+  coord_sf(crs=crs)+
+  theme_bw()+
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        #axis.line = element_blank(),
+        panel.background = element_rect(fill = "#f5f5f2", color = NA),
+        panel.border = element_rect(colour = "black",size = 0.5), #element_blank()
+        legend.position = "none",
+        aspect.ratio = 3/4)  #bottom none
+
+plot2<-ggplot()+
+  geom_raster(data=type2,aes(x = x,y = y,fill = layer))+
+  scale_fill_distiller(palette = "PuRd",direction = 1)+
+  geom_polygon(data=Counties_shape_draw,aes(x=long,y=lat,group=id),fill = NA,colour = "black",size = 0.3)+
+  coord_sf(crs=crs)+
+  theme_bw()+
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        #axis.line = element_blank(),
+        panel.background = element_rect(fill = "#f5f5f2", color = NA),
+        panel.border = element_rect(colour = "black",size = 0.5), #element_blank()
+        legend.position = "none",
+        aspect.ratio = 3/4)  #bottom none
+
+plot3<-ggplot()+
+  geom_raster(data=type3,aes(x = x,y = y,fill = layer))+
+  scale_fill_distiller(palette = "PuRd",direction = 1)+
+  geom_polygon(data=Counties_shape_draw,aes(x=long,y=lat,group=id),fill = NA,colour = "black",size = 0.3)+
+  coord_sf(crs=crs)+
+  theme_bw()+
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        #axis.line = element_blank(),
+        panel.background = element_rect(fill = "#f5f5f2", color = NA),
+        panel.border = element_rect(colour = "black",size = 0.5), #element_blank()
+        legend.position = "none",
+        aspect.ratio = 3/4)  #bottom none
+
+plot4<-ggplot()+
+  geom_raster(data=type4,aes(x = x,y = y,fill = layer))+
+  scale_fill_distiller(palette = "PuBu",direction = 1)+
+  geom_polygon(data=Counties_shape_draw,aes(x=long,y=lat,group=id),fill = NA,colour = "black",size = 0.3)+
+  coord_sf(crs=crs)+
+  theme_bw()+
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        #axis.line = element_blank(),
+        panel.background = element_rect(fill = "#f5f5f2", color = NA),
+        panel.border = element_rect(colour = "black",size = 0.5), #element_blank()
+        legend.position = "none",
+        aspect.ratio = 3/4)  #bottom none
+
+plot5<-ggplot()+
+  geom_raster(data=type5,aes(x = x,y = y,fill = layer))+
+  scale_fill_distiller(palette = "BuGn",direction = 1)+
+  geom_polygon(data=Counties_shape_draw,aes(x=long,y=lat,group=id),fill = NA,colour = "black",size = 0.3)+
+  coord_sf(crs=crs)+
+  theme_bw()+
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        #axis.line = element_blank(),
+        panel.background = element_rect(fill = "#f5f5f2", color = NA),
+        panel.border = element_rect(colour = "black",size = 0.5), #element_blank()
+        legend.position = "none",
+        aspect.ratio = 3/4)  #bottom none
+
+plot6<-ggplot()+
+  geom_raster(data=type6,aes(x = x,y = y,fill = layer))+
+  scale_fill_distiller(palette = "BuGn",direction = 1)+
+  geom_polygon(data=Counties_shape_draw,aes(x=long,y=lat,group=id),fill = NA,colour = "black",size = 0.3)+
+  coord_sf(crs=crs)+
+  theme_bw()+
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        #axis.line = element_blank(),
+        panel.background = element_rect(fill = "#f5f5f2", color = NA),
+        panel.border = element_rect(colour = "black",size = 0.5), #element_blank()
+        legend.position = "none",
+        aspect.ratio = 3/4)  #bottom none
+
+plot7<-ggplot()+
+  geom_raster(data=type7,aes(x = x,y = y,fill = layer))+
+  scale_fill_distiller(palette = "BuGn",direction = 1)+
+  geom_polygon(data=Counties_shape_draw,aes(x=long,y=lat,group=id),fill = NA,colour = "black",size = 0.3)+
+  coord_sf(crs=crs)+
+  theme_bw()+
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        #axis.line = element_blank(),
+        panel.background = element_rect(fill = "#f5f5f2", color = NA),
+        panel.border = element_rect(colour = "black",size = 0.5), #element_blank()
+        legend.position = "none",
+        aspect.ratio = 3/4)  #bottom none
+
+plot8<-ggplot()+
+  geom_raster(data=type8,aes(x = x,y = y,fill = layer))+
+  scale_fill_distiller(palette = "PuBu",direction = 1)+
+  geom_polygon(data=Counties_shape_draw,aes(x=long,y=lat,group=id),fill = NA,colour = "black",size = 0.3)+
+  coord_sf(crs=crs)+
+  theme_bw()+
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        #axis.line = element_blank(),
+        panel.background = element_rect(fill = "#f5f5f2", color = NA),
+        panel.border = element_rect(colour = "black",size = 0.5), #element_blank()
+        legend.position = "none",
+        aspect.ratio = 3/4)  #bottom none
+
+
+library(cowplot)
+library(eoffice)
+plot_grid(plot1,plot5,plot2,plot6,plot3,plot7,plot4,plot8,
+          nrow = 4,labels="auto",
+          label_size = 9,align = "v")
+
+#topptx(filename = "test4.pptx",width = 12, height = 12)
+write.csv(res_region_stat,file = "E:/Article writing/data/Revelant code/Explained_variables.csv")
+
+```
+
+
+### Preparing explanatory variables
+
+
+```{r}
+library(terra)
+library(rgdal)
+library(raster)
+library(readxl)
+
+Counties_shape = readOGR("E:/Article writing/data/Datasets/Counties_shapefile/Counties_LoessPlateau_pro.shp",
+                             layer = "Counties_LoessPlateau_pro")
+Counties_shape$ID=1:334
+
+##----socioeconomic factors----##
+#population and urbanization
+population_urban = read_xlsx("E:/Article writing/data/Datasets/Population/Population.xlsx")
+code=Counties_shape$Code
+code=data.frame(code)
+code$ID=rownames(code)
+population_urban=merge(population_urban,code,by.x = "Code", by.y = "code")
+population_urban=population_urban[,c(9,10)]
+
+##Night light
+NL2000=raster("E:/Article writing/data/Datasets/Nightlight/DMSP2000.tif")
+NL2020=raster("E:/Article writing/data/Datasets/Nightlight/DMSP2020.tif")
+new_crs="+proj=aea +lat_0=0 +lon_0=105 +lat_1=25 +lat_2=47 +x_0=4000000 +y_0=0 +datum=WGS84 +units=m +no_defs"
+#现在这个没有运行成功
+NL2000=projectRaster(NL2000,new_crs)
+NL2020=projectRaster(NL2020,new_crs)
+Extr_NL_2000=raster::extract(NL2000, Counties_shape,fun=mean)
+Extr_NL_2020=raster::extract(NL2020, Counties_shape,fun=mean)
+NL_20_00=data.frame(NL20_00=Extr_NL_2020-Extr_NL_2000)
+write.csv(NL_20_00,file = "E:/Article writing/data/Datasets/Nightlight/NL_20_00.csv")
+NL_20_00=read.csv("E:/Article writing/data/Datasets/Nightlight/NL_20_00.csv")
+
+##Afforestation
+affor=raster("E:/Article writing/data/Datasets/Afforestation/AFF+REF02-19.tif")
+new_crs="+proj=aea +lat_0=0 +lon_0=105 +lat_1=25 +lat_2=47 +x_0=4000000 +y_0=0 +datum=WGS84 +units=m +no_defs"
+affor=projectRaster(affor,crs=new_crs)
+Extr_affor=raster::extract(affor, Counties_shape,fun=mean,na.rm=TRUE)
+Extr_affor=data.frame(Extr_affor)
+colnames(Extr_affor)=c("Extr_affor")
+
+##Land use conversion (Globalland 30 data)
+LU2000=raster("E:/Article writing/data/Datasets/Land_use/Globalland30/2000.tif")
+LU2020=raster("E:/Article writing/data/Datasets/Land_use/Globalland30/2020.tif")
+LU2000=as(LU2000, "SpatialPixelsDataFrame")
+LU2000=as.data.frame(LU2000) %>% 
+  rename(LU2000 = X2000)
+LU2020=as(LU2020, "SpatialPixelsDataFrame")
+LU2020=as.data.frame(LU2020) %>% 
+  rename(LU2020 = X2020)
+LU2020=LU2020[-which(LU2020$LU2020==128),]
+
+#Reclassifiy land use data
+LU2000$RLU2000=ifelse(LU2000$LU2000==10,"Cultivated land",
+                      ifelse(LU2000$LU2000 %in% c(20,40),"Forest",
+                             ifelse(LU2000$LU2000==30,"Grassland",
+                                    ifelse(LU2000$LU2000==80, "Artificial Surfaces", "others"))))
+
+LU2020$RLU2020=ifelse(LU2020$LU2020==10,"Cultivated land",
+                      ifelse(LU2020$LU2020 %in% c(20,40),"Forest",
+                             ifelse(LU2020$LU2020==30,"Grassland",
+                                    ifelse(LU2020$LU2020==80, "Artificial Surfaces", "others"))))
+
+#conbine reclassified land use 2000 and 2019
+LU00_20=cbind(LU2000[,c(2:4)],LU2020[,4])
+colnames(LU00_20)=c("x","y","RLU2000","RLU2020")
+LU00_20$change=paste(as.character(LU00_20$RLU2000),as.character(LU00_20$RLU2020),sep="->")
+LU00_20$change.recl[LU00_20$change=="Artificial Surfaces->Artificial Surfaces"|
+                      LU00_20$change=="Cultivated land->Cultivated land"|
+                      LU00_20$change=="Forest->Forest"|
+                      LU00_20$change=="Grassland->Grassland"]="unchanged"
+LU00_20$change.recl[LU2020$RLU2020=="others"]="others"
+LU00_20$change.recl[LU00_20$change=="Artificial Surfaces->Forest"|
+                      LU00_20$change=="Cultivated land->Forest"|
+                      LU00_20$change=="Grassland->Forest"|
+                      LU00_20$change=="others->Forest"]="To_forest"
+LU00_20$change.recl[LU00_20$change=="Artificial Surfaces->Grassland"|
+                      LU00_20$change=="Cultivated land->Grassland"|
+                      LU00_20$change=="Forest->Grassland"|
+                      LU00_20$change=="others->Grassland"]="To_grassland"
+LU00_20$change.recl[LU00_20$change=="Artificial Surfaces->Cultivated land"|
+                      LU00_20$change=="Forest->Cultivated land"|
+                      LU00_20$change=="Grassland->Cultivated land"|
+                      LU00_20$change=="others->Cultivated land"]="To_agriculture"
+LU00_20$change.recl[LU00_20$change=="Cultivated land->Artificial Surfaces"|
+                      LU00_20$change=="Forest->Artificial Surfaces"|
+                      LU00_20$change=="Grassland->Artificial Surfaces"|
+                      LU00_20$change=="others->Artificial Surfaces"]="To_settlement"
+
+table(LU00_20$change.recl)
+#To_agriculture 22047 "1"
+#To_forest 20484 "2"
+#To_grassland 25287 "3"
+#To_settlement 16824 "4"
+#others 29601 "5"
+#unchanged 508693 "6"
+LU00_20$change.id[LU00_20$change.recl=="To_agriculture"]=1
+LU00_20$change.id[LU00_20$change.recl=="To_forest"]=2
+LU00_20$change.id[LU00_20$change.recl=="To_grassland"]=3
+LU00_20$change.id[LU00_20$change.recl=="To_settlement"]=4
+LU00_20$change.id[LU00_20$change.recl=="others"]=5
+LU00_20$change.id[LU00_20$change.recl=="unchanged"]=6
+
+#From data.frame to raster
+crs="+proj=aea +lat_0=0 +lon_0=105 +lat_1=25 +lat_2=47 +x_0=4000000 +y_0=0 +datum=WGS84 +units=m +no_defs"
+LU00_20_change2=rasterFromXYZ(LU00_20[,c(1,2,7)],crs=crs)
+writeRaster(LU00_20_change2,filename = "E:/Article writing/data/Datasets/Land_use/Globalland30/LU00_20_change2.tif")
+
+LU_stat<-raster::extract(LU00_20_change2, Counties_shape)
+
+LU_region_stat<-data.frame()
+for (i in 1:334){
+  type1<-table(LU_stat[[i]])["1"]/length(LU_stat[[i]])
+  type1<-as.data.frame(type1)
+  rownames(type1)<-1
+  type2<-table(LU_stat[[i]])["2"]/length(LU_stat[[i]])
+  type2<-as.data.frame(type2)
+  rownames(type2)<-1
+  type3<-table(LU_stat[[i]])["3"]/length(LU_stat[[i]])
+  type3<-as.data.frame(type3)
+  rownames(type3)<-1
+  type4<-table(LU_stat[[i]])["4"]/length(LU_stat[[i]])
+  type4<-as.data.frame(type4)
+  rownames(type4)<-1
+  type5<-table(LU_stat[[i]])["5"]/length(LU_stat[[i]])
+  type5<-as.data.frame(type5)
+  rownames(type5)<-1
+  type6<-table(LU_stat[[i]])["6"]/length(LU_stat[[i]])
+  type6<-as.data.frame(type6)
+  rownames(type6)<-1
+  bind<-data.frame(type1,type2,type3,type4,type5,type6)
+  LU_region_stat<-rbind(LU_region_stat,bind)
+}
+
+LU_region_stat[is.na(LU_region_stat)] = 0
+colnames(LU_region_stat)=c("To_agriculture","To_forest","To_grassland","To_settlement","others","unchanged")
+LU_region_stat=LU_region_stat[,c("To_agriculture","To_forest","To_grassland","To_settlement")]
+#Counties_shape2<-merge(Counties_shape,res_region_stat,by.x = "ID", by.y = "ID") 
+
+##Land use conversion (ESA CCI data)
+LU2000=raster("E:/Article writing/data/Datasets/Land_use/2000.tif")
+LU2019=raster("E:/Article writing/data/Datasets/Land_use/2019.tif")
+LU2000=as(LU2000, "SpatialPixelsDataFrame")
+LU2000=as.data.frame(LU2000) %>% 
+  rename(LU2000 = X2000)
+LU2019=as(LU2019, "SpatialPixelsDataFrame")
+LU2019=as.data.frame(LU2019) %>% 
+  rename(LU2019 = X2019)
+
+#Reclassifiy land use data
+LU2000$RLU2000=ifelse(LU2000$LU2000 %in% c(10,11,12,20,30,40),"Agriculture",
+                      ifelse(LU2000$LU2000 %in% c(50,60,61,62,70,71,72,80,81,82,90,100,160,170),"Forest",
+                             ifelse(LU2000$LU2000 %in% c(110,130),"Grassland",
+                                    ifelse(LU2000$LU2000==190, "Settlement", "others"))))
+
+LU2019$RLU2019=ifelse(LU2019$LU2019 %in% c(10,11,12,20,30,40),"Agriculture",
+                      ifelse(LU2019$LU2019 %in% c(50,60,61,62,70,71,72,80,81,82,90,100,160,170),"Forest",
+                             ifelse(LU2019$LU2019 %in% c(110,130),"Grassland",
+                                    ifelse(LU2019$LU2019==190, "Settlement", "others"))))
+
+
+#conbine reclassified land use 2000 and 2019
+LU00_19=cbind(LU2000[,c(2:4)],LU2019[,4])
+colnames(LU00_19)=c("x","y","RLU2000","RLU2019")
+LU00_19$change=paste(as.character(LU00_19$RLU2000),as.character(LU00_19$RLU2019),sep="->")
+LU00_19$change.recl[LU2000$RLU2000==LU2019$RLU2019]="unchanged"
+LU00_19$change.recl[LU2019$RLU2019=="others"]="others"
+
+LU00_19$change.recl[LU00_19$change=="Agriculture->Forest"|
+                      LU00_19$change=="Grassland->Forest"|
+                      LU00_19$change=="others->Forest"]="To_forest"
+LU00_19$change.recl[LU00_19$change=="Agriculture->Grassland"|
+                      LU00_19$change=="Forest->Grassland"|
+                      LU00_19$change=="others->Grassland"]="To_grassland"
+LU00_19$change.recl[LU00_19$change=="Forest->Agriculture"|
+                      LU00_19$change=="Grassland->Agriculture"|
+                      LU00_19$change=="others->Agriculture"]="To_agriculture"
+LU00_19$change.recl[LU00_19$change=="Agriculture->Settlement"|
+                      LU00_19$change=="Forest->Settlement"|
+                      LU00_19$change=="Grassland->Settlement"|
+                      LU00_19$change=="others->Settlement"]="To_settlement"
+
+table(LU00_19$change.recl)
+#To_agriculture 35880 "1"
+#To_forest 38812 "2"
+#To_grassland 189385 "3"
+#To_settlement 124915 "4"
+#others 188057 "5"
+#unchanged 6916976 "6"
+LU00_19$change.id[LU00_19$change.recl=="To_agriculture"]=1
+LU00_19$change.id[LU00_19$change.recl=="To_forest"]=2
+LU00_19$change.id[LU00_19$change.recl=="To_grassland"]=3
+LU00_19$change.id[LU00_19$change.recl=="To_settlement"]=4
+LU00_19$change.id[LU00_19$change.recl=="others"]=5
+LU00_19$change.id[LU00_19$change.recl=="unchanged"]=6
+
+#From data.frame to raster
+crs="+proj=aea +lat_0=0 +lon_0=105 +lat_1=25 +lat_2=47 +x_0=4000000 +y_0=0 +datum=WGS84 +units=m +no_defs"
+LU00_19_change2=rasterFromXYZ(LU00_19[,c(1,2,7)],crs=crs)
+writeRaster(LU00_19_change2,filename = "E:/Article writing/data/Datasets/Land_use/Globalland30/LU00_20_change2.tif")
+
+LU_stat<-raster::extract(LU00_19_change2, Counties_shape)
+
+LU_region_stat<-data.frame()
+for (i in 1:334){
+  type1<-table(LU_stat[[i]])["1"]/length(LU_stat[[i]])
+  type1<-as.data.frame(type1)
+  rownames(type1)<-1
+  type2<-table(LU_stat[[i]])["2"]/length(LU_stat[[i]])
+  type2<-as.data.frame(type2)
+  rownames(type2)<-1
+  type3<-table(LU_stat[[i]])["3"]/length(LU_stat[[i]])
+  type3<-as.data.frame(type3)
+  rownames(type3)<-1
+  type4<-table(LU_stat[[i]])["4"]/length(LU_stat[[i]])
+  type4<-as.data.frame(type4)
+  rownames(type4)<-1
+  type5<-table(LU_stat[[i]])["5"]/length(LU_stat[[i]])
+  type5<-as.data.frame(type5)
+  rownames(type5)<-1
+  type6<-table(LU_stat[[i]])["6"]/length(LU_stat[[i]])
+  type6<-as.data.frame(type6)
+  rownames(type6)<-1
+  bind<-data.frame(type1,type2,type3,type4,type5,type6)
+  LU_region_stat<-rbind(LU_region_stat,bind)
+  print(i)
+}
+
+LU_region_stat[is.na(LU_region_stat)] = 0
+colnames(LU_region_stat)=c("To_agriculture","To_forest","To_grassland","To_settlement","others","unchanged")
+LU_region_stat=LU_region_stat[,c("To_agriculture","To_forest","To_grassland","To_settlement")]
+
+##----natural factors----##
+##Annual mean precipitation
+pre_filename=list.files(path="E:/Article writing/data/Datasets/Precipitation", pattern = '.tif$')
+pre_file=paste0("E:/Article writing/data/Datasets/Precipitation/",pre_filename)
+pre = stack(pre_file) 
+Extr_pre=raster::extract(pre, Counties_shape,fun=mean,na.rm=TRUE)
+
+x=1:21
+pre_trend=data.frame()
+for (i in 1:334){
+  slope=lm(Extr_pre[i,]~x)$coefficients[2]
+  pre_trend=rbind(pre_trend,slope)
+}
+
+colnames(pre_trend)=c("pre_trend")
+write.csv(pre_trend,file = "E:/Article writing/data/Datasets/Precipitation/pre_trend.csv")
+
+pre_trend=read.csv("E:/Article writing/data/Datasets/Precipitation/pre_trend.csv")
+
+
+##Precipitation variability (Coefficient of variation)
+pre_cv=calc(pre, cv)
+Extr_pre_cv=raster::extract(pre_cv, Counties_shape,fun=mean,na.rm=TRUE)
+Extr_pre_cv=data.frame(Extr_pre_cv)
+colnames(Extr_pre_cv)=c("pre_cv")
+write.csv(Extr_pre_cv,file = "E:/Article writing/data/Datasets/Precipitation/Extr_pre_cv.csv")
+Extr_pre_cv=read.csv("E:/Article writing/data/Datasets/Precipitation/Extr_pre_cv.csv")
+
+##Annual mean temperature
+tem_filename=list.files(path="E:/Article writing/data/Datasets/Temperature", pattern = '.tif$')
+tem_file=paste0("E:/Article writing/data/Datasets/Temperature/",tem_filename)
+tem = stack(tem_file) 
+Extr_tem=raster::extract(tem, Counties_shape,fun=mean,na.rm=TRUE)
+
+x=1:21
+tem_trend=data.frame()
+for (i in 1:334){
+  slope=lm(Extr_tem[i,]~x)$coefficients[2]
+  tem_trend=rbind(tem_trend,slope)
+}
+
+colnames(tem_trend)=c("tem_trend")
+write.csv(tem_trend,file = "E:/Article writing/data/Datasets/Temperature/tem_trend.csv")
+tem_trend=read.csv("E:/Article writing/data/Datasets/Temperature/tem_trend.csv")
+
+##Temperature variability (Coefficient of variation)
+tem_cv=calc(tem, cv)
+Extr_tem_cv=raster::extract(tem_cv, Counties_shape,fun=mean,na.rm=TRUE)
+Extr_tem_cv=data.frame(Extr_tem_cv)
+colnames(Extr_tem_cv)=c("tem_cv")
+write.csv(Extr_tem_cv,file = "E:/Article writing/data/Datasets/Temperature/Extr_tem_cv.csv")
+Extr_tem_cv=read.csv("E:/Article writing/data/Datasets/Temperature/Extr_tem_cv.csv")
+
+#Potential evapotranspiration
+pet_filename=list.files(path="E:/Article writing/data/Datasets/Potential evapotranspiration", pattern = '.tif$')
+pet_file=paste0("E:/Article writing/data/Datasets/Potential evapotranspiration/",pet_filename)
+pet = stack(pet_file) 
+Extr_pet=raster::extract(pet, Counties_shape,fun=mean,na.rm=TRUE)
+
+x=1:21
+pet_trend=data.frame()
+for (i in 1:334){
+  slope=lm(Extr_pet[i,]~x)$coefficients[2]
+  pet_trend=rbind(pet_trend,slope)
+}
+
+colnames(pet_trend)=c("pet_trend")
+write.csv(pet_trend,file = "E:/Article writing/data/Datasets/Potential evapotranspiration/pet_trend.csv")
+
+pet_trend=read.csv("E:/Article writing/data/Datasets/Potential evapotranspiration/pet_trend.csv")
+
+##Soil moisture
+sm_filename=list.files(path="E:/Article writing/data/Datasets/Soil_moisture", pattern = '.tif$')
+sm_file=paste0("E:/Article writing/data/Datasets/Soil_moisture/",sm_filename)
+sm = stack(sm_file)  
+Extr_sm=raster::extract(sm, Counties_shape,fun=mean)
+
+x=1:21
+sm_trend=data.frame()
+for (i in 1:334){
+  slope=lm(Extr_sm[i,]~x)$coefficients[2]
+  sm_trend=rbind(sm_trend,slope)
+}
+
+colnames(sm_trend)=c("sm_trend")
+write.csv(sm_trend,file = "E:/Article writing/data/Datasets/Soil_moisture/sm_trend.csv")
+
+sm_trend=read.csv("E:/Article writing/data/Datasets/Soil_moisture/sm_trend.csv")
+
+##Downward surface shortwave radiation
+DSSR_flnames<-list.files(path="F:/1958_2020 TerraClimate datasets/Downward surface shortwave radiation/1 download",pattern = '.nc')
+DSSR_fl<-paste0('F:/1958_2020 TerraClimate datasets/Downward surface shortwave radiation/1 download/',DSSR_flnames)
+
+DSSR_data=data.frame(ID=1:334)
+new_crs="+proj=aea +lat_0=0 +lon_0=105 +lat_1=25 +lat_2=47 +x_0=4000000 +y_0=0 +datum=WGS84 +units=m +no_defs"
+for (i in 1:21){
+  DSSR_year=app(rast(DSSR_fl[i]), mean)
+  DSSR_year=as(DSSR_year, "Raster")
+  DSSR_year=projectRaster(DSSR_year,crs=new_crs,res=4638.3)
+  DSSR_year=DSSR_year*0.1
+  DSSR_mean=raster::extract(DSSR_year, Counties_shape,fun=mean)
+  DSSR_mean=data.frame(DSSR_mean)
+  DSSR_data=cbind(DSSR_data,DSSR_mean)
+  print(i)
+}
+
+write.csv(DSSR_data,file="E:/Article writing/data/Datasets/Downward surface shortwave radiation/DSSR_data.csv")
+DSSR_data=read.csv("E:/Article writing/data/Datasets/Downward surface shortwave radiation/DSSR_data.csv")
+
+DSSR_data=DSSR_data[,-1]
+DSSR_data=as.matrix(DSSR_data)
+x=1:21
+DSSR_trend=data.frame()
+for (i in 1:334){
+  slope=lm(DSSR_data[i,]~x)$coefficients[2]
+  DSSR_trend=rbind(DSSR_trend,slope)
+}
+
+colnames(DSSR_trend)=c("DSSR_trend")
+
+##Palmer Drought Severity Index
+PDSI_flnames<-list.files(path="F:/1958_2020 TerraClimate datasets/Palmer Drought Severity Index",pattern = '.nc')
+PDSI_fl<-paste0('F:/1958_2020 TerraClimate datasets/Palmer Drought Severity Index/',PDSI_flnames)
+
+PDSI_data=data.frame(ID=1:334)
+new_crs="+proj=aea +lat_0=0 +lon_0=105 +lat_1=25 +lat_2=47 +x_0=4000000 +y_0=0 +datum=WGS84 +units=m +no_defs"
+for (i in 1:21){
+  PDSI_year=app(rast(PDSI_fl[i]), mean)
+  PDSI_year=as(PDSI_year, "Raster")
+  PDSI_year=projectRaster(PDSI_year,crs=new_crs,res=4638.3)
+  #PDSI_year=PDSI_year*0.01
+  PDSI_mean=raster::extract(PDSI_year, Counties_shape,fun=mean)
+  PDSI_mean=data.frame(PDSI_mean)
+  PDSI_data=cbind(PDSI_data,PDSI_mean)
+  print(i)
+}
+
+write.csv(PDSI_data,file="E:/Article writing/data/Datasets/Palmer Drought Severity Index/PDSI_data.csv")
+PDSI_data=read.csv("E:/Article writing/data/Datasets/Palmer Drought Severity Index/PDSI_data.csv")
+
+PDSI_data=PDSI_data[,-1]
+PDSI_data=as.matrix(PDSI_data)
+x=1:21
+PDSI_trend=data.frame()
+for (i in 1:334){
+  slope=lm(PDSI_data[i,]~x)$coefficients[2]
+  PDSI_trend=rbind(PDSI_trend,slope)
+}
+
+colnames(PDSI_trend)=c("PDSI_trend")
+
+## Soil sand content
+SSC_filename=list.files(path="E:/Article writing/data/Datasets/Soil sand content", pattern = '.tif$')
+SSC_file=paste0("E:/Article writing/data/Datasets/Soil sand content/",SSC_filename)
+SSC = rast(SSC_file)
+new_crs="+proj=aea +lat_0=0 +lon_0=105 +lat_1=25 +lat_2=47 +x_0=4000000 +y_0=0 +datum=WGS84 +units=m +no_defs"
+SSC=terra::project(SSC, new_crs)
+SSC_mean=app(SSC,mean)
+SSC_mean=SSC_mean*0.001
+SSC_mean=raster(SSC_mean)
+
+Extr_SSC=raster::extract(SSC_mean, Counties_shape,fun=mean,na.rm=TRUE)
+Extr_SSC=data.frame(Extr_SSC)
+colnames(Extr_SSC)=c("Extr_SSC")
+
+write.csv(Extr_SSC,file = "E:/Article writing/data/Datasets/Soil sand content/Extr_SSC.csv")
+Extr_SSC=read.csv("E:/Article writing/data/Datasets/Soil sand content/Extr_SSC.csv")
+
+
+# Soil nitorgen content
+SNC_filename=list.files(path="E:/Article writing/data/Datasets/Soil nitrogen content", pattern = '.tif$')
+SNC_file=paste0("E:/Article writing/data/Datasets/Soil nitrogen content/",SNC_filename)
+SNC = rast(SNC_file)
+SNC_mean=app(SNC,mean)
+new_crs="+proj=aea +lat_0=0 +lon_0=105 +lat_1=25 +lat_2=47 +x_0=4000000 +y_0=0 +datum=WGS84 +units=m +no_defs"
+SNC_mean=terra::project(SNC_mean, new_crs)
+SNC_mean=raster(SNC_mean)
+
+Extr_SNC=raster::extract(SNC_mean, Counties_shape,fun=mean,na.rm=TRUE)
+Extr_SNC=data.frame(Extr_SNC)
+colnames(Extr_SNC)=c("Extr_SNC")
+
+write.csv(Extr_SNC,file = "E:/Article writing/data/Datasets/Soil nitrogen content/Extr_SNC.csv")
+Extr_SNC=read.csv("E:/Article writing/data/Datasets/Soil nitrogen content/Extr_SNC.csv")
+
+# Soil organic carbon content
+SOC_filename=list.files(path="E:/Article writing/data/Datasets/Soil organic carbon content", pattern = '.tif$')
+SOC_file=paste0("E:/Article writing/data/Datasets/Soil organic carbon content/",SOC_filename)
+SOC = rast(SOC_file)
+SOC_mean=app(SOC,mean)
+new_crs="+proj=aea +lat_0=0 +lon_0=105 +lat_1=25 +lat_2=47 +x_0=4000000 +y_0=0 +datum=WGS84 +units=m +no_defs"
+SOC_mean=terra::project(SOC_mean, new_crs)
+SOC_mean=raster(SOC_mean)
+
+Extr_SOC=raster::extract(SOC_mean, Counties_shape,fun=mean,na.rm=TRUE)
+Extr_SOC=data.frame(Extr_SOC)
+colnames(Extr_SOC)=c("Extr_SOC")
+
+write.csv(Extr_SOC,file = "E:/Article writing/data/Datasets/Soil organic carbon content/Extr_SOC.csv")
+Extr_SOC=read.csv("E:/Article writing/data/Datasets/Soil organic carbon content/Extr_SOC.csv")
+
+##----Merge all data----##
+Explanatory_variables<-cbind(population_urban,NL_20_00,Extr_affor,LU_region_stat,pre_trend,Extr_pre_cv,tem_trend,Extr_tem_cv,pet_trend,sm_trend,DSSR_trend,PDSI_trend,Extr_SSC,Extr_SNC,Extr_SOC)
+
+write.csv(Explanatory_variables,file = "E:/Article writing/data/Revelant code/Explanatory_variables.csv")
+```
+
+
+### Modeling and graphing (Figure 6a)
+
+```{r}
+library(psych)
+library(reshape2)
+library(tidyverse)
+library(magrittr)
+library(relaimpo)
+library(MASS)
+library(aplot)
+library(GGally)
+
+#read data
+indep_var <- read.csv("Explanatory_variables.csv") %>% column_to_rownames(var="sample")
+dep_var <- read.csv("Explained_variables.csv") %>% column_to_rownames(var="sample")
+which(is.na(indep_var),arr.ind = T) #row 13 154
+which(is.na(dep_var),arr.ind = T) #none
+indep_var=indep_var[-c(13,154),]
+dep_var=dep_var[-c(13,154),]
+
+
+metdata <- data.frame()
+envdata <- data.frame()
+
+# Multivariate linear regression and variance decomposition
+for (i in colnames(dep_var)){
+  type_name <- i
+  env_type <- cbind(indep_var, dep_var[type_name])
+  colnames(env_type)[ncol(env_type)] <- 'type'
+  fit <- lm(type~., data = env_type)
+  #  stepAIC() select the best model
+  fit_simple <- stepAIC(fit, direction = 'backward')
+  crf <- calc.relimp(fit_simple,rela=FALSE)
+  env_improtance <- crf$lmg %>% as.data.frame() %>% 
+    rownames_to_column(var="env") %>% 
+    mutate(type=i) %>% set_colnames(c("env","importance","type"))
+  
+  envdata <- rbind(envdata,env_improtance)
+  
+  lm_stat <- summary(fit_simple)
+  lm_stat$r.squared   #original R2
+  radj <- lm_stat$adj.r.squared  # adjusted R2
+  F <- lm_stat$fstatistic 
+  pvalue <- pf(F[1], F[2], F[3], lower.tail = FALSE) #p value
+  metdata[i,1]= radj
+  metdata[i,2]= pvalue
+}
+
+# merge
+lm_result <- metdata %>% as.data.frame() %>% 
+  rownames_to_column(var="id") %>% set_colnames(c("id","radj","pvalue")) %>% 
+  mutate(p_signif=symnum(pvalue, corr = FALSE, na = FALSE,  
+                         cutpoints = c(0, 0.001, 0.01, 0.05, 0.1, 1), 
+                         symbols = c("***", "**", "*", "", " ")))
+
+# correlation
+spearman <- corr.test(indep_var, dep_var, method = 'spearman', adjust = 'none')
+
+
+p1 <- melt(spearman$r) %>% mutate(pvalue=melt(spearman$p.adj)[,3],
+                                  p_signif=symnum(pvalue, corr = FALSE, na = FALSE,  
+                                                  cutpoints = c(0, 0.001, 0.01, 0.05, 0.1, 1), 
+                                                  symbols = c("***", "**", "*", "", " "))) %>% 
+  set_colnames(c("env","type","r","p","p_signif")) %>% 
+  ggplot(.,aes(type,env))+
+  geom_tile(aes(fill=r),color="white",size=0.5)+
+  coord_equal()+
+  geom_text(aes(label=p_signif),size=3,color="white",hjust=0.5,vjust=0.7)+
+  geom_point(data = envdata,aes(x = type, y = env,size = importance*100),shape=22) +
+  scale_size_continuous(range = c(0,8)) +
+  labs(x = NULL,y = NULL,color=NULL,fill=NULL,size = 'Importance (%)')+
+  scale_color_gradientn(colours = rev(RColorBrewer::brewer.pal(11,"BrBG")))+ #RdBu
+  scale_fill_gradientn(colours = rev(RColorBrewer::brewer.pal(11,"BrBG")))+
+  scale_x_discrete(expand=c(0,0))+
+  scale_y_discrete(expand=c(0,0),position = 'left') +
+  theme(axis.text.x=element_text(angle =50,hjust =1,vjust =1,color="black",size = 10),
+        #axis.text.y=element_text(color="black",size =10),
+        axis.text.y = element_blank(),
+        axis.ticks= element_blank(),
+        legend.background = element_blank(),
+        legend.key = element_blank())
+
+p2<-melt(spearman$r) %>% dplyr::select(Var1) %>% distinct() %>% mutate(group="A") %>% 
+  ggplot(aes(group,Var1))+
+  geom_text(aes(group,Var1,label=Var1),size=3,color="black") +
+  geom_stripped_rows()+
+  theme(panel.grid.major = element_blank(),
+        axis.text=element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank())
+
+p1 %>% insert_left(p2,width = 0.2)
+
+library(eoffice)
+
+topptx(filename = "test.pptx",width=9,height = 9)
+
+
+ggplot(lm_result,aes(id,radj*100,label=p_signif))+
+  geom_col(fill = '#4882B2',width = 0.6)+
+  geom_text(aes(label=p_signif),size=5,color="black",hjust=0.5,vjust=0.5)+
+  labs(title = 'Explained variation (%)',x=NULL,y=NULL)+
+  theme(panel.grid = element_blank(), panel.background = element_blank(), 
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        title=element_text(size=8,color="black"),
+        axis.text.y = element_text(color = 'black'), 
+        axis.line = element_line(color = 'black'),axis.ticks = element_line(color = 'black')) +
+  scale_y_continuous(expand = c(0,0.5))
+
+#explained variance
+library(pheatmap)
+library(RColorBrewer)
+pheatmapdata=data.frame(lm_result$radj)
+pheatmapdata=t(pheatmapdata)
+
+pheatmap::pheatmap(pheatmapdata, color=rev(brewer.pal(n = 10, name = "BrBG")[1:5]),border_color = "white",
+                   cluster_row = FALSE,scale = "row",
+                   cluster_col=FALSE,cellwidth = 20, cellheight = 20,legend = FALSE,show_rownames = FALSE)
+
+```
+
+### Scatter plot(Figure 6b-d)
+
+```{r}
+library(ggpmisc)
+library(ggsci)
+
+##====theme function====##
+theme_custom <- function(){
+  myTheme <- theme(panel.background = element_rect(fill = 'white',color = 'black',size = 0.5),
+                   panel.grid = element_blank(),
+                   legend.position = 'none',
+                   plot.margin = margin(5,5,3,3),
+                   plot.background = element_blank(),
+                   axis.ticks = element_line(size = 0.2),
+                   axis.ticks.length = unit(-0.15,'lines'),
+                   axis.title.y = element_text(size = 10.5,margin = margin(0,3,0,0),face = 'bold',family = 'Times'),
+                   axis.title.x = element_text(size = 10.5,margin = margin(4,0,0,0),face = 'bold',family = 'Times'),
+                   axis.text.y = element_text(size = 9,margin = margin(0,6,0,0),family = 'Times',color = '#000000'),
+                   axis.text.x = element_text(size = 9,margin = margin(8,0,0,0),family = 'Times',color = '#000000'))
+  return(myTheme)
+}
+##====theme function====##
+
+indep_var <- read.csv("Explanatory_variables.csv") %>% column_to_rownames(var="sample")
+dep_var <- read.csv("Explained_variables.csv") %>% column_to_rownames(var="sample")
+which(is.na(indep_var),arr.ind = T) #row 13 154
+which(is.na(dep_var),arr.ind = T) #none
+indep_var=indep_var[-c(13,154),]
+dep_var=dep_var[-c(13,154),]
+all_data=cbind(indep_var,dep_var)
+
+
+ggplot(data=all_data,aes(x=NL20_00,y=type3))+
+  geom_point(shape=1,color="#3f72af", size=3)+
+  geom_smooth(method = "lm", se=TRUE, 
+              color="black")+
+   stat_poly_eq(method = 'lm',
+               aes(label=paste(after_stat(rr.label),
+                               after_stat(p.value.label),sep = "*\", \"*")),
+               size=4)+
+  theme(panel.background = element_rect(fill = 'white',color = 'black',size = 0.5),
+        panel.grid = element_blank(),
+        plot.margin = margin(5,5,3,3),
+        plot.background = element_blank())
+
+ggplot(data=all_data,aes(x=To_settlement,y=type3))+
+  geom_point(shape=1,color="#3f72af", size=3)+
+  geom_smooth(method = "lm", se=TRUE, 
+              color="black")+
+   stat_poly_eq(method = 'lm',
+               aes(label=paste(after_stat(rr.label),
+                               after_stat(p.value.label),sep = "*\", \"*")),
+               size=4)+
+  theme(panel.background = element_rect(fill = 'white',color = 'black',size = 0.5),
+        panel.grid = element_blank(),
+        plot.margin = margin(5,5,3,3),
+        plot.background = element_blank())
+
+
+ggplot(data=all_data,aes(x=Extr_affor,y=type5))+
+  geom_point(shape=1,color="#3f72af", size=3)+
+  geom_smooth(method = "lm", se=TRUE, 
+              color="black")+
+   stat_poly_eq(method = 'lm',
+               aes(label=paste(after_stat(rr.label),
+                               after_stat(p.value.label),sep = "*\", \"*")),
+               size=4)+
+  theme(panel.background = element_rect(fill = 'white',color = 'black',size = 0.5),
+        panel.grid = element_blank(),
+        plot.margin = margin(5,5,3,3),
+        plot.background = element_blank())
+```
+
+
+
+
+
