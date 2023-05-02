@@ -1,0 +1,2 @@
+# Ecosystem_Productivity_Trajectory
+The code for calculating ecosystem productivity trajectories was modified from the published article: Berdugo, M., Gaitan, J. J., Delgado-Baquerizo, M., Crowther, T. W., & Dakos, V. (2022). Prevalence and drivers of abrupt vegetation shifts in global drylands. Proceedings of the National Academy of Sciences of the United States of America, 119(43), 1–10. https://doi.org/10.1073/pnas.2123393119
