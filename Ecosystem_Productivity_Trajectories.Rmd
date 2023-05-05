@@ -215,7 +215,7 @@ Steps are further filtered based on the next criteria:
 
 #### Criteria 1: The extremes
 
-Steps whose change point occurs in the extremes (2000-2003 or 2016-2019) are discarded.
+Steps whose change point occurs in the extremes (2000-2002 or 2018-2020) are discarded.
 
 #### Criteria 2: How standard deviation on changepoints influence certainty
 
@@ -690,11 +690,11 @@ ggplot(data=LU_type,aes(x=name,y=value,fill=type))+
                      expand = expansion(mult=c(0.01,0.01)),
                      breaks = seq(0,1,by=0.25),
                      labels=c("0","25%","50%","75%","100%"))+
-  theme(panel.grid.major.x = element_line(), #x轴内部ticks的坐标线
-        axis.title = element_blank(), #去除坐标轴标题
+  theme(panel.grid.major.x = element_line(), 
+        axis.title = element_blank(), 
         plot.title = element_text(hjust=0.5),
-        axis.text.y = element_text(size=9), #y轴的刻度线标签
-        axis.text.x = element_text(size=9), #y轴的刻度线标签
+        axis.text.y = element_text(size=9), 
+        axis.text.x = element_text(size=9),
         legend.title = element_blank())
 
 topptx(filename = "3d.pptx")
@@ -1028,7 +1028,7 @@ population_urban=population_urban[,c(9,10)]
 NL2000=raster("E:/Article writing/data/Datasets/Nightlight/DMSP2000.tif")
 NL2020=raster("E:/Article writing/data/Datasets/Nightlight/DMSP2020.tif")
 new_crs="+proj=aea +lat_0=0 +lon_0=105 +lat_1=25 +lat_2=47 +x_0=4000000 +y_0=0 +datum=WGS84 +units=m +no_defs"
-#现在这个没有运行成功
+
 NL2000=projectRaster(NL2000,new_crs)
 NL2020=projectRaster(NL2020,new_crs)
 Extr_NL_2000=raster::extract(NL2000, Counties_shape,fun=mean)
